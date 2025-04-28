@@ -117,23 +117,28 @@ def clean_ds(ds_id):
             fillna_config=body.get("fillna")
         )
 
-        # 3️⃣  Convert to pure-Python types so Mongo + JSON can store/return it
+        # 3️⃣  Automatically encode categorical columns (after cleaning)
+        for col in df_clean.columns:
+            if df_clean[col].dtype == 'object' or pd.api.types.is_categorical_dtype(df_clean[col]):
+                df_clean[col] = df_clean[col].astype('category').cat.codes
+
+        # 4️⃣  Convert to pure-Python types so Mongo + JSON can store/return it
         cleaned_records = df_clean.applymap(convert_np).to_dict("records")
 
-        # 4️⃣  Persist the cleaned version in MongoDB
+        # 5️⃣  Persist the cleaned and encoded version in MongoDB
         update_dataset(
             ds_id,
             "cleaned_data",
             cleaned_records,
-            "cleaning"
+            "cleaning + encoding categorical"
         )
 
-        # 5️⃣  Return both a status message **and** the cleaned dataset
+        # 6️⃣  Return both a status message **and** the cleaned dataset
         return jsonify({
-            "message": "Dataset cleaned successfully.",
+            "message": "Dataset cleaned and encoded successfully.",
             "dataset_id": ds_id,
             "row_count": len(cleaned_records),
-            "cleaned_data": cleaned_records        # ← what you asked for
+            "cleaned_data": cleaned_records
         }), 200
 
     except Exception as e:

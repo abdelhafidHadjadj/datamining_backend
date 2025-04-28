@@ -98,3 +98,5 @@ def normalize_dataframe(df: pd.DataFrame, columns: list[str], method: str = "min
             df[col] = (df[col] - median) / iqr if iqr != 0 else 0.0
 
     return df
+
+

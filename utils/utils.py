@@ -1,67 +1,91 @@
-import pandas as pd
-import numpy as np
-from sklearn.metrics import silhouette_score
-from scipy.spatial.distance import cdist
-from collections import defaultdict
+# utils/utils.py
 import json
-from bson import ObjectId
+from collections import defaultdict
 from datetime import datetime
-def clean_dataframe(df, drop_columns=None, fillna_config=None):
-    false_values = ["??", "N/A", "NA", "missing", "undefined", "null", "None", "", "?"]
-    df.replace(false_values, np.nan, inplace=True)
+from typing import Dict, List, Tuple
 
+import numpy as np
+import pandas as pd
+from bson import ObjectId
+from scipy.spatial.distance import cdist
+from sklearn.metrics import silhouette_score
+
+FALSE_VALUES = [
+    "??",
+    "N/A",
+    "NA",
+    "missing",
+    "undefined",
+    "null",
+    "None",
+    "",
+    "?",
+]
+
+
+# ───────────────────────── helpers ─────────────────────────
+def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
+    df2 = df.copy()
+    df2.columns = [c.strip().lower() for c in df2.columns]
+    return df2
+
+
+def profile_dataframe(df: pd.DataFrame) -> Dict:
+    df = normalize_cols(df)
+    prof = {}
     for col in df.columns:
-        if df[col].dtype == object:
-            try:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-            except Exception as e:
-                print(f"[WARN] Échec de conversion de la colonne '{col}' : {e}")
-
-    analysis_info = []
-    total_rows = len(df)
-
-    print("=== ANALYSE AVANT TRAITEMENT ===")
-    for col in df.columns:
-        missing_indices = df[df[col].isna()].index.tolist()
-        info = {
-            "column": col,
-            "dtype": df[col].dtype,
-            "total_rows": total_rows,
-            "missing_count": df[col].isna().sum(),
-            "missing_indices": missing_indices
+        s = df[col]
+        prof[col] = {
+            "dtype": str(s.dtype),
+            "missing_pct": round(s.isna().mean() * 100, 2),
+            "skew": float(s.skew()) if s.dtype.kind in "if" else None,
+            "top": s.value_counts(dropna=True).head(3).to_dict(),
         }
-        analysis_info.append(info)
-        print(f"[INFO] {col} - Type: {info['dtype']}, Total: {info['total_rows']}, Missing: {info['missing_count']}")
+    return prof
 
-    if drop_columns:
-        df = df.drop(columns=drop_columns, errors='ignore')
 
-    if fillna_config:
-        for col, method in fillna_config.items():
-            if col not in df.columns:
-                print(f"[WARN] Colonne '{col}' absente, ignorée.")
-                continue
-            try:
-                if method == 'mean':
-                    val = df[col].mean()
-                elif method == 'median':
-                    val = df[col].median()
-                elif method == 'mode':
-                    mode_series = df[col].mode()
-                    val = mode_series[0] if not mode_series.empty else None
-                elif method == 'min':
-                    val = df[col].min()
-                elif method == 'max':
-                    val = df[col].max()
-                else:
-                    val = method  # default value
+def clean_dataframe(
+    df: pd.DataFrame, rules: Dict[str, Dict]
+) -> Tuple[pd.DataFrame, List[str]]:
+    df = normalize_cols(df)
+    df.replace(FALSE_VALUES, np.nan, inplace=True)
 
-                df[col].fillna(val, inplace=True)
-                print(f"[DEBUG] Colonne {col} remplie par {method}: {val}")
-            except Exception as e:
-                print(f"[ERROR] Erreur lors du remplissage de '{col}' : {e}")
+    for col in df.select_dtypes(include="object"):
+        df[col] = pd.to_numeric(df[col], errors="ignore")
 
-    return df, analysis_info
+    to_drop, imputed = [], []
+    for col, spec in rules.items():
+        if col not in df.columns:
+            continue
+        if spec.get("action") == "drop":
+            to_drop.append(col)
+            continue
+
+        method = spec.get("method", "").lower()
+        if method:
+            if method == "mean":
+                val = df[col].mean()
+            elif method == "median":
+                val = df[col].median()
+            elif method == "mode":
+                val = (
+                    df[col].mode(dropna=True).iloc[0]
+                    if not df[col].mode().empty
+                    else np.nan
+                )
+            elif method == "min":
+                val = df[col].min()
+            elif method == "max":
+                val = df[col].max()
+            else:
+                val = spec["method"]
+            df[col] = df[col].fillna(val)
+            imputed.append(col)
+
+    if to_drop:
+        df.drop(columns=to_drop, inplace=True)
+
+    return df, imputed
 
 
 def generate_metadata(df: pd.DataFrame, file_size) -> dict:
@@ -70,7 +94,7 @@ def generate_metadata(df: pd.DataFrame, file_size) -> dict:
         "columns": df.columns.tolist(),
         "nbr_col": len(df.columns),
         "missing_values": {},
-        "dtypes": {col: str(df[col].dtype) for col in df.columns}
+        "dtypes": {col: str(df[col].dtype) for col in df.columns},
     }
 
     for col in df.columns:
@@ -78,7 +102,7 @@ def generate_metadata(df: pd.DataFrame, file_size) -> dict:
         if missing_positions:
             metadata["missing_values"][col] = {
                 "count": len(missing_positions),
-                "position": missing_positions
+                "position": missing_positions,
             }
 
     return metadata
@@ -94,12 +118,12 @@ def convert_np(value):
     return value
 
 
-
 def normalize_zscore(df: pd.DataFrame, columns: list) -> pd.DataFrame:
     for col in columns:
         if pd.api.types.is_numeric_dtype(df[col]):
             df[col] = (df[col] - df[col].mean()) / df[col].std()
     return df
+
 
 def normalize_minmax(df: pd.DataFrame, columns: list) -> pd.DataFrame:
     for col in columns:
@@ -109,30 +133,21 @@ def normalize_minmax(df: pd.DataFrame, columns: list) -> pd.DataFrame:
 
 
 def compute_metrics(data, labels):
-   
-
     unique_labels = list(set(labels))
-    print("⛏️ Types dans compute_metrics:")
-    print(data.dtypes)
-    print("Shape:", data.shape)
-    print("Type des labels:", type(labels), "Exemple:", labels[:5])
-
     if len(unique_labels) <= 1 or (set(unique_labels) == {-1}):
         return {
             "silhouette_score": None,
             "intra_class_distance": None,
-            "inter_class_distance": None
+            "inter_class_distance": None,
         }
 
     try:
         silhouette = silhouette_score(data, labels)
-    except Exception as e:
-        print("Erreur silhouette_score:", e)
+    except Exception:
         silhouette = None
 
-    # Intra-class distance
     clusters = defaultdict(list)
-    for point, label in zip(data.values, labels):  # ✅ fix ici
+    for point, label in zip(data.values, labels):
         if label != -1:
             clusters[label].append(point)
 
@@ -148,7 +163,6 @@ def compute_metrics(data, labels):
 
     intra_class = np.mean(intra_dists) if intra_dists else None
 
-    # Inter-class distance
     centroids = np.array(centroids)
     if len(centroids) > 1:
         pairwise_dists = cdist(centroids, centroids)
@@ -158,27 +172,29 @@ def compute_metrics(data, labels):
         inter_class = None
 
     return {
-        "silhouette_score": round(silhouette, 4) if silhouette is not None else None,
-        "intra_class_distance": round(intra_class, 4) if intra_class is not None else None,
-        "inter_class_distance": round(inter_class, 4) if inter_class is not None else None
+        "silhouette_score": round(silhouette, 4)
+        if silhouette is not None
+        else None,
+        "intra_class_distance": round(intra_class, 4)
+        if intra_class is not None
+        else None,
+        "inter_class_distance": round(inter_class, 4)
+        if inter_class is not None
+        else None,
     }
 
 
-
-
 def convert_to_serializable(obj):
-    """Convertit des objets numpy en types Python natifs compatibles JSON."""
     if isinstance(obj, np.ndarray):
-        return obj.tolist()  # Conversion en liste
+        return obj.tolist()
     elif isinstance(obj, dict):
         return {key: convert_to_serializable(value) for key, value in obj.items()}
     elif isinstance(obj, list):
         return [convert_to_serializable(item) for item in obj]
-    return obj  # Si c'est un objet compatible JSON, retourne-le tel quel
+    return obj
 
 
 def clean_for_json(obj):
-    """Recursively clean data for JSON serialization."""
     if isinstance(obj, list):
         return [clean_for_json(x) for x in obj]
     elif isinstance(obj, dict):

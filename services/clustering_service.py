@@ -1,112 +1,142 @@
+# services/clustering_service.py (add at bottom)
+import uuid, time
 from datetime import datetime
-import pandas as pd
+from sklearn.metrics import calinski_harabasz_score, davies_bouldin_score, silhouette_score
+from models.mongo import clustering_collection
+from sklearn.cluster import KMeans
+from sklearn_extra.cluster import KMedoids              # pip install scikit-extra
+from scipy.spatial.distance import cdist                # for K-Medoids SSE
 import numpy as np
-from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
-from sklearn_extra.cluster import KMedoids
-import uuid
-import json
-from utils.utils import compute_metrics, convert_to_serializable
-from models.mongo import datasets_collection, clustering_results_collection
-def perform_clustering(dataset_id, method, n_clusters, eps, min_samples, columns=None):
-    # Convertir dataset_id en str (assure la compatibilité avec MongoDB)
-    dataset_id = str(dataset_id)
-    print("Requête MongoDB avec l'ID:", dataset_id)
 
-    # Récupération du dataset depuis MongoDB
-    dataset = datasets_collection.find_one({"_id": dataset_id})
-    if not dataset:
-        raise ValueError("Dataset not found")
 
-    # Chargement des données nettoyées ou normalisées
-    df = pd.DataFrame(dataset.get("normalized_data") or dataset.get("cleaned_data"))
-    if df.empty:
-        raise ValueError("Dataset is empty")
 
-    # Si des colonnes spécifiques sont fournies, filtrer le DataFrame
-    if columns:
-        try:
-            df = df[columns]
-        except KeyError as e:
-            raise ValueError(f"Invalid column names: {e}")
 
-    print("col selected: ", df)
-    # Forcer la conversion de toutes les colonnes spécifiées en numérique
-    if columns:
-        df[columns] = df[columns].apply(pd.to_numeric, errors="coerce")
-        numeric_df = df[columns].select_dtypes(include=[np.number])
-    else:
-        numeric_df = df.select_dtypes(include=[np.number])
-
-    # Vérification que des colonnes numériques sont disponibles
-    if numeric_df.empty:
-        raise ValueError("No numeric columns available for clustering after conversion.")
-
-    # Option : drop les lignes NaN ou les remplir selon besoin
-    numeric_df = numeric_df.dropna()  # ou .fillna(0) si tu préfères
-
-    print("Dtypes après conversion :", numeric_df.dtypes)
-    print("Aperçu des données numériques :", numeric_df.head())
-
-    # Choix du modèle
-    if method == "kmeans":
-        model = KMeans(n_clusters=n_clusters)
-    elif method == "dbscan":
-        model = DBSCAN(eps=eps, min_samples=min_samples)
-    elif method == "agnes":
-        model = AgglomerativeClustering(n_clusters=n_clusters, linkage="ward")
-    elif method == "diana":
-        model = AgglomerativeClustering(n_clusters=n_clusters, linkage="complete")
-    elif method == "kmedoids":
-        model = KMedoids(n_clusters=n_clusters)
-    else:
-        raise ValueError(f"Unsupported clustering method: {method}. Supported methods: kmeans, dbscan, agnes, diana, kmedoids.")
-
-    # Calcul des clusters
-    labels = model.fit_predict(numeric_df)
-    if isinstance(labels, np.ndarray):
-        labels = labels.tolist()
-
-    if method == "dbscan":
-        n_clusters = len(set(labels)) - (1 if -1 in labels else 0)
-
-    # Calcul des métriques
-    metrics = compute_metrics(numeric_df, labels)
-
-    # Debug infos
-    print("Labels:", labels)
-    print("Metrics:", metrics)
-
-    # Nettoyage des colonnes (si dictionnaire)
-    if isinstance(columns, dict):
-        columns = list(columns.keys())
-    elif not isinstance(columns, list):
-        columns = [columns]
-
-    # S’assurer que toutes les colonnes sont des chaînes de caractères
-    columns = [str(col) for col in columns]
-
-    # Préparation des données à insérer
-    result = {
-        "_id": str(uuid.uuid4()),
-        "dataset_id": dataset_id,
-        "method": method,
-        "parameters": {
-            "n_clusters": n_clusters,
-            "eps": eps,
-            "min_samples": min_samples,
-            "columns": columns if isinstance(columns, list) else [columns]
-        },
-        "labels": labels,
-        "metrics": metrics,  # Stocké comme JSON string
-        "created_at": datetime.now()
+def _base_metrics(X, labels, sse=None, ssc=None):
+    """Compute all generic metrics that exist for this algorithm."""
+    metrics = {
+        "sse"             : sse,
+        "ssc"             : ssc,
+        "silhouette_avg"  : silhouette_score(X, labels) if len(set(labels)) > 1 else None,
+        "calinski_harabaz": calinski_harabasz_score(X, labels) if len(set(labels)) > 1 else None,
+        "davies_bouldin"  : davies_bouldin_score(X, labels)    if len(set(labels)) > 1 else None,
     }
+    return {k: v for k, v in metrics.items() if v is not None}
 
-    print("Structure à insérer :", result)
+def save_clustering_result(dataset_id, method,
+                           parameters,          # dict
+                           X, labels,           # ndarray + list/ndarray
+                           extra_results=None,  # dict specific to the algo
+                           sse=None, ssc=None,  # optional pre-computed scores
+                           start_time=None):
+    """
+    Generic saver: plugs into every algorithm’s route.
+    """
+    doc = {
+        "_id"       : str(uuid.uuid4()),
+        "dataset_id": dataset_id,
+        "method"    : method,
+        "parameters": parameters,
+        "metrics"   : _base_metrics(X, labels, sse, ssc),
+        "results"   : {
+            "labels"           : labels.tolist() if hasattr(labels, "tolist") else list(labels),
+            "cluster_sizes"    : {str(c): int((labels == c).sum()) for c in set(labels)},
+        },
+        "runtime_sec": round(time.perf_counter() - start_time, 4) if start_time else None,
+        "created_at" : datetime.utcnow()
+    }
+    if extra_results:
+        doc["results"].update(extra_results)
 
-    # Insertion dans la base MongoDB
-    clustering_results_collection.insert_one(result)
-
-    # Génération d’un aperçu des clusters
+    clustering_collection.insert_one(doc)
+    return doc   # handy if caller wants to send it back to the UI
 
 
-    return result
+
+# ────────────────────────────  ELBOW HELPERS  ────────────────────────────
+
+
+def compute_elbow_kmeans(X: np.ndarray, k_min: int = 1, k_max: int = 10):
+    """Returns a list of SSE (inertia) for k = k_min … k_max (inclusive)."""
+    sse = []
+    for k in range(k_min, k_max + 1):
+        km = KMeans(n_clusters=k, random_state=42, n_init="auto")
+        km.fit(X)
+        sse.append(float(km.inertia_))                  # inertia_ = SSE
+    return sse
+
+def compute_elbow_kmedoids(X: np.ndarray,
+                           k_min: int = 1,
+                           k_max: int = 10,
+                           metric: str = "euclidean"):
+    """Returns SSE for K-Medoids; we compute it manually."""
+    sse = []
+    for k in range(k_min, k_max + 1):
+        km = KMedoids(n_clusters=k,
+                      metric=metric,
+                      method="pam",
+                      random_state=42)
+        km.fit(X)
+        medoids = X[km.medoid_indices_]                # true representatives
+        # Squared Euclidean distance to nearest medoid
+        dist2 = np.min(cdist(X, medoids, metric=metric)**2, axis=1)
+        sse.append(float(dist2.sum()))
+    return sse
+
+
+
+def run_kmeans(X: np.ndarray, k: int):
+    """
+    Run K-Means clustering on given data.
+
+    Parameters
+    ----------
+    X : np.ndarray
+        The input data (n_samples, n_features).
+    k : int
+        Number of clusters to form.
+
+    Returns
+    -------
+    result : dict
+        {
+            "labels": np.ndarray,
+            "centers": np.ndarray,
+            "sse": float,
+            "ssc": float,
+            "silhouette_values": np.ndarray
+        }
+    """
+    model = KMeans(
+        n_clusters=k,
+        random_state=42,
+        n_init="auto"
+    )
+    labels = model.fit_predict(X)
+    centers = model.cluster_centers_
+
+    # SSE
+    sse = float(model.inertia_)
+
+    # SSC (Sum of Squared Cosine distances)
+    normX = X / np.linalg.norm(X, axis=1, keepdims=True)
+    normCenters = centers / np.linalg.norm(centers, axis=1, keepdims=True)
+    cos_sim = (normX @ normCenters.T)[np.arange(X.shape[0]), labels]
+    ssc = float(np.sum(1 - cos_sim))
+
+    # Silhouette per sample
+    if len(set(labels)) > 1:  # silhouette needs at least 2 clusters
+        sil_values = silhouette_score(X, labels, sample_size=len(X), random_state=42, metric="euclidean")
+        from sklearn.metrics import silhouette_samples
+        sil_samples = silhouette_samples(X, labels, metric="euclidean")
+    else:
+        sil_values = None
+        sil_samples = np.zeros(len(X))
+
+    return {
+        "labels": labels,
+        "centers": centers,
+        "sse": sse,
+        "ssc": ssc,
+        "silhouette_score": sil_values,
+        "silhouette_values": sil_samples
+    }

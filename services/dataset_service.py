@@ -1,146 +1,100 @@
-import pandas as pd
-import numpy as np
 import uuid
-from utils.utils import clean_dataframe, convert_np, normalize_minmax, normalize_zscore
-from models.mongo import datasets_collection
+import pandas as pd
 from datetime import datetime
+from bson import ObjectId
+import numpy as np
+from models.mongo import datasets_collection
+from utils.utils import convert_np, FALSE_VALUES
 
 
+# ─── Helpers ──────────────────────────────────────────────────────────────
+def _now() -> datetime:
+    return datetime.utcnow()
 
-def save_dataset(file_name: str, df: pd.DataFrame, metadata):
-    # Nettoyage des données pour stockage MongoDB
-    raw_data = df.applymap(convert_np).to_dict(orient='records')
-    dataset_doc = {
+
+# ─── Sauvegarder un dataset brut ──────────────────────────────────────────
+def save_dataset(file_name: str, df: pd.DataFrame, meta: dict) -> dict:
+    doc = {
         "_id": str(uuid.uuid4()),
         "file_name": file_name,
-        "raw_data": raw_data,
+        "raw_data": df.applymap(convert_np).to_dict("records"),
         "cleaned_data": None,
-        "metadata": metadata,
+        "normalized_data": None,
+        "metadata": meta,
         "preprocessing_steps": [],
-        "upload_date": datetime.now()
+        "upload_date": _now()
     }
-
-    datasets_collection.insert_one(dataset_doc)
-    return dataset_doc
-
-def get_dataset(dataset_id):
-    return datasets_collection.find_one({"_id": dataset_id})
+    datasets_collection.insert_one(doc)
+    return doc
 
 
-def clean_dataset(dataset_id, processing_params):
-    dataset = get_dataset(dataset_id)
-    if not dataset:
-        raise ValueError("Dataset not found")
-
-    # Utiliser les données déjà traitées si elles existent
-    base_data = dataset.get("cleaned_data") or dataset.get("raw_data") or dataset.get("raw_preview")
-    df = pd.DataFrame(base_data)
-
-    drop_columns = processing_params.get("drop_columns", [])
-    fillna_config = processing_params.get("fill_missing", {})
-
-    # Nettoyage uniquement sur les colonnes non ignorées
-    columns_to_clean = [col for col in df.columns if col not in drop_columns]
-    df_clean_target = df[columns_to_clean]
-
-    cleaned_df, _ = clean_dataframe(df_clean_target, drop_columns=[], fillna_config=fillna_config)
-
-    # Réinsérer les colonnes ignorées sans modification
-    for col in drop_columns:
-        if col in df.columns:
-            cleaned_df[col] = df[col]
-
-    # Réorganiser dans l'ordre original
-    cleaned_df = cleaned_df[df.columns]
-
-    # Ajouter l'étape de nettoyage dans les steps
-    steps = dataset.get("preprocessing_steps", [])
-    steps.append({
-        "step": "cleaning",
-        "columns": fillna_config,
-        "ignored_columns": drop_columns,
-        "method": "statistical",
-        "cleaned_at": datetime.now()
-
-    })
-
-    # Mettre à jour le dataset avec les nouvelles données nettoyées
-    update_dataset(dataset_id, cleaned_df, preprocessing_steps=steps)
-
-    # Générer une prévisualisation
-    preview = cleaned_df.head(10).replace({np.nan: None}).to_dict(orient="records")
-    preview = [{k: convert_np(v) for k, v in row.items()} for row in preview]
-
-    return cleaned_df, preview
+# ─── Récupérer un dataset par ID ──────────────────────────────────────────
+def get_dataset(ds_id: str) -> dict | None:
+    return datasets_collection.find_one({"_id": ds_id})
 
 
-def update_dataset(dataset_id, cleaned_df: pd.DataFrame = None, preprocessing_steps: list = None, normalized_df: pd.DataFrame = None):
-    update_fields = {}
-
-    if cleaned_df is not None:
-        cleaned_data = cleaned_df.applymap(convert_np).to_dict(orient='records')
-        update_fields["cleaned_data"] = cleaned_data
-
-    if normalized_df is not None:
-        normalized_data = normalized_df.applymap(convert_np).to_dict(orient='records')
-        update_fields["normalized_data"] = normalized_data
-
-    if preprocessing_steps is not None:
-        update_fields["preprocessing_steps"] = preprocessing_steps
-
+# ─── Mettre à jour un dataset (champ + étape) ─────────────────────────────
+def update_dataset(ds_id: str, field: str, data, step: str) -> None:
     datasets_collection.update_one(
-        {"_id": dataset_id},
-        {"$set": update_fields}
+        {"_id": ds_id},
+        {
+            "$set": {field: data},
+            "$push": {"preprocessing_steps": step}
+        }
     )
 
 
-def normalize_dataset(dataset_id, method="zscore", selected_columns=None):
-    dataset = get_dataset(dataset_id)
-    if not dataset:
-        raise ValueError("Dataset not found")
+def clean_dataframe(
+    df: pd.DataFrame,
+    drop_columns: list[str] = None,
+    fillna_config: dict[str, str] = None,
+) -> pd.DataFrame:
+    df.replace(FALSE_VALUES, np.nan, inplace=True)
 
-    # On part toujours de processed_data (données nettoyées)
-    base_data = dataset.get("cleaned_data") or dataset.get("raw_data")
-    df = pd.DataFrame(base_data)
+    if drop_columns:
+        df.drop(columns=drop_columns, inplace=True, errors="ignore")
 
-    if not selected_columns:
-        raise ValueError("No columns selected for normalization")
+    if fillna_config:
+        for col, method in fillna_config.items():
+            if col not in df.columns:
+                continue
+            if method == "mean":
+                df[col] = df[col].fillna(df[col].mean())
+            elif method == "median":
+                df[col] = df[col].fillna(df[col].median())
+            elif method == "mode":
+                mode = df[col].mode(dropna=True)
+                if not mode.empty:
+                    df[col] = df[col].fillna(mode.iloc[0])
+            elif method == "min":
+                df[col] = df[col].fillna(df[col].min())
+            elif method == "max":
+                df[col] = df[col].fillna(df[col].max())
+            else:
+                df[col] = df[col].fillna(method)
+    
+    return df
 
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    target_cols = [col for col in selected_columns if col in numeric_cols]
 
-    if not target_cols:
-        raise ValueError("Selected columns are not numeric or do not exist")
+def normalize_dataframe(df: pd.DataFrame, columns: list[str], method: str = "minmax") -> pd.DataFrame:
+    if method not in ["minmax", "zscore", "robust"]:
+        raise ValueError(f"Unsupported normalization method: {method}")
 
-    normalized_df = df.copy()
+    for col in columns:
+        if col not in df.columns or not pd.api.types.is_numeric_dtype(df[col]):
+            continue  # Skip invalid or non-numeric columns
 
-    if method == "zscore":
-        for col in target_cols:
-            mean = df[col].mean()
-            std = df[col].std()
-            normalized_df[col] = (df[col] - mean) / std if std != 0 else 0
-    elif method == "minmax":
-        for col in target_cols:
-            min_val = df[col].min()
-            max_val = df[col].max()
-            normalized_df[col] = (df[col] - min_val) / (max_val - min_val) if max_val != min_val else 0
-    else:
-        raise ValueError("Unsupported normalization method")
+        if method == "minmax":
+            min_val, max_val = df[col].min(), df[col].max()
+            df[col] = (df[col] - min_val) / (max_val - min_val) if min_val != max_val else 0.0
 
-    # Ajouter l'étape à l'historique
-    steps = dataset.get("preprocessing_steps", [])
-    steps.append({
-        "step": "normalization",
-        "method": method,
-        "columns": target_cols,
-        "normalize_at": datetime.now()
-    })
+        elif method == "zscore":
+            mean, std = df[col].mean(), df[col].std()
+            df[col] = (df[col] - mean) / std if std != 0 else 0.0
 
-    # Enregistrer dans normalized_data uniquement
-    update_dataset(dataset_id, normalized_df=normalized_df, preprocessing_steps=steps)
+        elif method == "robust":
+            median = df[col].median()
+            iqr = df[col].quantile(0.75) - df[col].quantile(0.25)
+            df[col] = (df[col] - median) / iqr if iqr != 0 else 0.0
 
-    # Retourner un aperçu
-    preview = normalized_df.head(10).replace({np.nan: None}).to_dict(orient="records")
-    preview = [{k: convert_np(v) for k, v in row.items()} for row in preview]
-
-    return normalized_df, preview
+    return df

@@ -1,5 +1,5 @@
 from pymongo import MongoClient
-
+import os
 def get_db():
-    client = MongoClient("mongodb://localhost:27017/")
+    client = MongoClient(os.getenv("MONGO_URI"))
     return client["datamining"]
